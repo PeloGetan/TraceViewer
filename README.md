@@ -13,6 +13,8 @@ The current goal of the project is to provide a simpler and faster alternative t
 
 At the moment the first public version is focused on **CPU profiling from local `.utrace` files**. The architecture is intentionally modular so GPU, networking, live connection, and other analysis modules can be added later.
 
+![TraceViewer screenshot](Resources/screenshot.png)
+
 ## Current Features
 
 - Open local Unreal Engine `.utrace` files

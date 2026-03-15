@@ -93,24 +93,39 @@
                                           IsChecked="{Binding IsExpanded, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}">
                                 <ToggleButton.Style>
                                     <Style TargetType="ToggleButton">
-                                        <Setter Property="Content" Value="в–ё" />
                                         <Setter Property="Template">
                                             <Setter.Value>
                                                 <ControlTemplate TargetType="ToggleButton">
                                                     <Border Background="{TemplateBinding Background}"
                                                             BorderBrush="{TemplateBinding BorderBrush}"
                                                             BorderThickness="0">
-                                                        <ContentPresenter HorizontalAlignment="Center"
-                                                                          VerticalAlignment="Center" />
+                                                        <Path x:Name="Chevron"
+                                                              Width="8"
+                                                              Height="8"
+                                                              HorizontalAlignment="Center"
+                                                              VerticalAlignment="Center"
+                                                              Data="M 0 0 L 6 4 L 0 8 Z"
+                                                              Fill="{TemplateBinding Foreground}"
+                                                              Stretch="Fill"
+                                                              RenderTransformOrigin="0.5,0.5">
+                                                            <Path.RenderTransform>
+                                                                <RotateTransform Angle="0" />
+                                                            </Path.RenderTransform>
+                                                        </Path>
                                                     </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsChecked" Value="True">
+                                                            <Setter TargetName="Chevron"
+                                                                    Property="RenderTransform">
+                                                                <Setter.Value>
+                                                                    <RotateTransform Angle="90" />
+                                                                </Setter.Value>
+                                                            </Setter>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
                                                 </ControlTemplate>
                                             </Setter.Value>
                                         </Setter>
-                                        <Style.Triggers>
-                                            <Trigger Property="IsChecked" Value="True">
-                                                <Setter Property="Content" Value="в–ѕ" />
-                                            </Trigger>
-                                        </Style.Triggers>
                                     </Style>
                                 </ToggleButton.Style>
                             </ToggleButton>
