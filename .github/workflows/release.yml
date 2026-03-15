@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    env:
+      SOLUTION_PATH: TraceViewer.sln
+      PROJECT_PATH: TraceViewer/TraceViewer.csproj
+      RUNTIME_ID: win-x64
+      PUBLISH_DIR: publish/win-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore $env:SOLUTION_PATH
+
+      - name: Build
+        shell: pwsh
+        run: dotnet build $env:SOLUTION_PATH -c Release --no-restore
+
+      - name: Test
+        shell: pwsh
+        run: dotnet test $env:SOLUTION_PATH -c Release --no-build
+
+      - name: Publish
+        shell: pwsh
+        run: >
+          dotnet publish $env:PROJECT_PATH
+          -c Release
+          -r $env:RUNTIME_ID
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -o $env:PUBLISH_DIR
+
+      - name: Archive release
+        id: archive
+        shell: pwsh
+        run: |
+          $version = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { "manual-${{ github.run_number }}" }
+          $archiveName = "TraceViewer-$version-win-x64.zip"
+          if (Test-Path $archiveName) {
+            Remove-Item $archiveName -Force
+          }
+
+          Compress-Archive -Path "$env:PUBLISH_DIR\\*" -DestinationPath $archiveName
+          "asset_name=$archiveName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: traceviewer-win-x64
+          path: ${{ steps.archive.outputs.asset_name }}
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.archive.outputs.asset_name }}
+          generate_release_notes: true
