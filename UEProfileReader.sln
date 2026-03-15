@@ -1,0 +1,22 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UEProfileReader", "UEProfileReader\UEProfileReader.csproj", "{5165B8BB-2804-419F-94AA-9AB8D05FE287}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UEProfileReader.Tests", "UEProfileReader.Tests\UEProfileReader.Tests.csproj", "{983F4EB8-45D1-4AC4-B871-17865609ADA4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5165B8BB-2804-419F-94AA-9AB8D05FE287}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5165B8BB-2804-419F-94AA-9AB8D05FE287}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5165B8BB-2804-419F-94AA-9AB8D05FE287}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5165B8BB-2804-419F-94AA-9AB8D05FE287}.Release|Any CPU.Build.0 = Release|Any CPU
+		{983F4EB8-45D1-4AC4-B871-17865609ADA4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{983F4EB8-45D1-4AC4-B871-17865609ADA4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{983F4EB8-45D1-4AC4-B871-17865609ADA4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{983F4EB8-45D1-4AC4-B871-17865609ADA4}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
