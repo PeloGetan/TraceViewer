@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using TraceViewer.Import;
 using TraceViewer.Query;
 using TraceViewer.SessionModel;
@@ -18,6 +19,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
     private readonly ThreadActivityQuery _threadActivityQuery;
     private readonly FunctionDetailsQuery _detailsQuery;
     private readonly List<ThreadTreeItemViewModel> _selectedThreadItems = [];
+    private readonly string _applicationVersion;
     private ThreadTreeItemViewModel? _selectionAnchor;
     private TraceImportResult? _importResult;
     private string _statusText;
@@ -43,7 +45,8 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         _frameTimelineQuery = frameTimelineQuery;
         _threadActivityQuery = threadActivityQuery;
         _detailsQuery = detailsQuery;
-        _statusText = "Open a local .utrace to populate frames, active threads, and function details.";
+        _applicationVersion = ResolveApplicationVersion();
+        _statusText = BuildStatusMessage("Open a local .utrace to populate frames, active threads, and function details.");
         ResetDetails();
     }
 
@@ -118,7 +121,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         var tracePath = FindDefaultTracePath();
         if (tracePath is null)
         {
-            StatusText = "No local .utrace found yet. Use Open Trace to load a file.";
+            StatusText = BuildStatusMessage("No local .utrace found yet. Use Open Trace to load a file.");
             return false;
         }
 
@@ -129,7 +132,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
     public async Task LoadTraceAsync(string traceFilePath)
     {
         IsLoading = true;
-        StatusText = $"Loading {Path.GetFileName(traceFilePath)}...";
+        StatusText = BuildStatusMessage($"Loading {Path.GetFileName(traceFilePath)}...");
 
         try
         {
@@ -138,7 +141,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         }
         catch (Exception exception)
         {
-            StatusText = $"Failed to load {Path.GetFileName(traceFilePath)}: {exception.Message}";
+            StatusText = BuildStatusMessage($"Failed to load {Path.GetFileName(traceFilePath)}: {exception.Message}");
             ClearTraceView();
         }
         finally
@@ -160,7 +163,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
 
         if (completedFrames.Length == 0)
         {
-            StatusText = $"Loaded {Path.GetFileName(sourceName)}, but no completed Game frames were found.";
+            StatusText = BuildStatusMessage($"Loaded {Path.GetFileName(sourceName)}, but no completed Game frames were found.");
             RefreshThreadItems(Array.Empty<ThreadFrameView>());
             ResetDetails();
             return;
@@ -170,7 +173,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         SelectFrame(selectedFrame);
 
         var threadCount = result.Session.Threads.GetOrderedThreads().Count;
-        StatusText = $"Loaded {Path.GetFileName(sourceName)}: {completedFrames.Length} Game frames, {threadCount} threads, {result.Session.CpuTimelines.Timelines.Count} CPU timelines.";
+        StatusText = BuildStatusMessage($"Loaded {Path.GetFileName(sourceName)}: {completedFrames.Length} Game frames, {threadCount} threads, {result.Session.CpuTimelines.Timelines.Count} CPU timelines.");
     }
 
     public void SelectFrame(FrameInfo frame)
@@ -532,6 +535,24 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         }
 
         return null;
+    }
+
+    private string BuildStatusMessage(string message)
+    {
+        return $"TraceViewer {_applicationVersion}  |  {message}";
+    }
+
+    private static string ResolveApplicationVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var informationalVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(informationalVersion))
+        {
+            var plusIndex = informationalVersion.IndexOf('+');
+            return plusIndex > 0 ? informationalVersion[..plusIndex] : informationalVersion;
+        }
+
+        return assembly.GetName().Version?.ToString(3) ?? "0.0.0";
     }
 
     private void ClearSelectedTreeItems()

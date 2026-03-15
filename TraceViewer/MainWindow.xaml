@@ -6,6 +6,7 @@
         xmlns:viewModels="clr-namespace:TraceViewer.UI.ViewModels"
         mc:Ignorable="d"
         Title="TraceViewer"
+        Icon="/Assets/TraceViewerLogo.ico"
         Height="840"
         Width="1440"
         MinHeight="640"
