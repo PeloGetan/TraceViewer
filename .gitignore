@@ -56,4 +56,5 @@ AGENTS.md
 /Docs
 /.idea
 *.utrace
+/test_01.utrace
 /publish

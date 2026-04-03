@@ -23,9 +23,20 @@ internal sealed class TraceEventStreamDecoder
         _packets = packets;
     }
 
-    public IReadOnlyList<TraceEvent> Decode()
+    public DecodeResult Decode(Action<TraceEvent>? eventSink = null, bool retainEvents = true)
     {
-        var events = new List<TraceEvent>();
+        var events = retainEvents ? new List<TraceEvent>() : [];
+        var eventCount = 0;
+
+        void Emit(TraceEvent traceEvent)
+        {
+            eventCount++;
+            eventSink?.Invoke(traceEvent);
+            if (retainEvents)
+            {
+                events.Add(traceEvent);
+            }
+        }
 
         foreach (var packet in _packets)
         {
@@ -33,7 +44,7 @@ internal sealed class TraceEventStreamDecoder
             {
                 try
                 {
-                    DecodeImportantPacket(packet, events);
+                    DecodeImportantPacket(packet, Emit);
                 }
                 catch (InvalidDataException)
                 {
@@ -51,7 +62,7 @@ internal sealed class TraceEventStreamDecoder
 
             try
             {
-                DecodeThreadPacket(packet, events);
+                DecodeThreadPacket(packet, Emit);
             }
             catch (InvalidDataException)
             {
@@ -63,15 +74,15 @@ internal sealed class TraceEventStreamDecoder
         {
             if (state.PendingEvent is { } pendingEvent)
             {
-                events.Add(FinalizeEvent(pendingEvent, state));
+                Emit(FinalizeEvent(pendingEvent, state));
                 state.PendingEvent = null;
             }
         }
 
-        return events;
+        return new DecodeResult(events, eventCount);
     }
 
-    private void DecodeImportantPacket(TracePacket packet, List<TraceEvent> events)
+    private void DecodeImportantPacket(TracePacket packet, Action<TraceEvent> emit)
     {
         var data = packet.Payload.Span;
         var offset = 0;
@@ -106,21 +117,21 @@ internal sealed class TraceEventStreamDecoder
             if (definition.MaybeHasAux)
             {
                 var payloadOffset = definition.FixedSize;
-                ConsumeAux(ref partial, payload, ref payloadOffset, state, events);
+                ConsumeAux(ref partial, payload, ref payloadOffset, state, emit);
                 if (!partial.IsComplete)
                 {
                     partial.IsComplete = true;
-                    events.Add(FinalizeEvent(partial, state));
+                    emit(FinalizeEvent(partial, state));
                 }
 
                 continue;
             }
 
-            events.Add(FinalizeEvent(partial, state));
+            emit(FinalizeEvent(partial, state));
         }
     }
 
-    private void DecodeThreadPacket(TracePacket packet, List<TraceEvent> events)
+    private void DecodeThreadPacket(TracePacket packet, Action<TraceEvent> emit)
     {
         var state = GetOrAddThreadState(packet.ThreadId);
         var data = packet.Payload.Span;
@@ -130,7 +141,7 @@ internal sealed class TraceEventStreamDecoder
         {
             if (state.PendingEvent is { } pendingEvent)
             {
-                ConsumeAux(ref pendingEvent, data, ref offset, state, events);
+                ConsumeAux(ref pendingEvent, data, ref offset, state, emit);
                 state.PendingEvent = pendingEvent.IsComplete ? null : pendingEvent;
                 if (state.PendingEvent is not null || offset >= data.Length)
                 {
@@ -146,7 +157,7 @@ internal sealed class TraceEventStreamDecoder
                     throw new InvalidDataException("Unexpected important event in thread packet.");
                 }
 
-                HandleWellKnownMarker(state, data, ref offset, events);
+                HandleWellKnownMarker(state, data, ref offset, emit);
                 continue;
             }
 
@@ -171,7 +182,7 @@ internal sealed class TraceEventStreamDecoder
 
             if (definition.MaybeHasAux)
             {
-                ConsumeAux(ref partial, data, ref offset, state, events);
+                ConsumeAux(ref partial, data, ref offset, state, emit);
                 if (!partial.IsComplete)
                 {
                     state.PendingEvent = partial;
@@ -181,11 +192,11 @@ internal sealed class TraceEventStreamDecoder
                 continue;
             }
 
-            events.Add(FinalizeEvent(partial, state));
+            emit(FinalizeEvent(partial, state));
         }
     }
 
-    private void HandleWellKnownMarker(ThreadState state, ReadOnlySpan<byte> data, ref int offset, List<TraceEvent> events)
+    private void HandleWellKnownMarker(ThreadState state, ReadOnlySpan<byte> data, ref int offset, Action<TraceEvent> emit)
     {
         var marker = data[offset] >> 1;
         switch (marker)
@@ -202,7 +213,7 @@ internal sealed class TraceEventStreamDecoder
 
             case 5: // LeaveScope
                 offset += 1;
-                EmitScopeLeave(state, CreateTimestamp(0), events);
+                EmitScopeLeave(state, CreateTimestamp(0), emit);
                 break;
 
             case 6: // EnterScope_TA
@@ -216,7 +227,7 @@ internal sealed class TraceEventStreamDecoder
             case 7: // LeaveScope_TA
             {
                 var timestamp = ReadStampedScopeTimestamp(data, ref offset, state, relativeToThreadBase: false);
-                EmitScopeLeave(state, timestamp, events);
+                EmitScopeLeave(state, timestamp, emit);
                 break;
             }
 
@@ -231,7 +242,7 @@ internal sealed class TraceEventStreamDecoder
             case 9: // LeaveScope_TB
             {
                 var timestamp = ReadStampedScopeTimestamp(data, ref offset, state, relativeToThreadBase: true);
-                EmitScopeLeave(state, timestamp, events);
+                EmitScopeLeave(state, timestamp, emit);
                 break;
             }
 
@@ -307,7 +318,7 @@ internal sealed class TraceEventStreamDecoder
         ReadOnlySpan<byte> data,
         ref int offset,
         ThreadState state,
-        List<TraceEvent> events)
+        Action<TraceEvent> emit)
     {
         while (offset < data.Length)
         {
@@ -318,14 +329,14 @@ internal sealed class TraceEventStreamDecoder
             {
                 offset += 1;
                 partial.IsComplete = true;
-                events.Add(FinalizeEvent(partial, state));
+                emit(FinalizeEvent(partial, state));
                 return;
             }
 
             if (!isAuxData)
             {
                 partial.IsComplete = true;
-                events.Add(FinalizeEvent(partial, state));
+                emit(FinalizeEvent(partial, state));
                 return;
             }
 
@@ -410,7 +421,7 @@ internal sealed class TraceEventStreamDecoder
         return traceEvent;
     }
 
-    private void EmitScopeLeave(ThreadState state, TraceTimestamp timestamp, List<TraceEvent> events)
+    private void EmitScopeLeave(ThreadState state, TraceTimestamp timestamp, Action<TraceEvent> emit)
     {
         if (state.ScopeStack.Count == 0)
         {
@@ -418,7 +429,7 @@ internal sealed class TraceEventStreamDecoder
         }
 
         var descriptor = state.ScopeStack.Pop();
-        events.Add(new TraceEvent(
+        emit(new TraceEvent(
             descriptor with { ScopePhase = TraceEventScopePhase.Leave },
             timestamp,
             state.ThreadId,
@@ -741,4 +752,6 @@ internal sealed class TraceEventStreamDecoder
         Reference = 1,
         DefinitionId = 2,
     }
+
+    internal sealed record DecodeResult(IReadOnlyList<TraceEvent> Events, int EventCount);
 }

@@ -6,6 +6,32 @@ public sealed class CpuCallTreeBuilder
 {
     private readonly record struct AggregationKey(string Name, TimerRef TimerRef);
 
+    private sealed class AggregationBucket
+    {
+        public required IReadOnlyList<CallTreeNode> Nodes { get; init; }
+
+        public IReadOnlyList<CallTreeNode> AggregatedChildren { get; set; } = Array.Empty<CallTreeNode>();
+
+        public bool ChildrenProcessed { get; set; }
+    }
+
+    private sealed class AggregationFrame
+    {
+        public AggregationFrame(IReadOnlyList<AggregationBucket> buckets, AggregationBucket? ownerBucket)
+        {
+            Buckets = buckets;
+            OwnerBucket = ownerBucket;
+        }
+
+        public IReadOnlyList<AggregationBucket> Buckets { get; }
+
+        public AggregationBucket? OwnerBucket { get; }
+
+        public int NextBucketIndex { get; set; }
+
+        public List<CallTreeNode> Result { get; } = [];
+    }
+
     private sealed class ActiveScope
     {
         public required TimerRef TimerRef { get; init; }
@@ -133,6 +159,47 @@ public sealed class CpuCallTreeBuilder
             return Array.Empty<CallTreeNode>();
         }
 
+        var stack = new Stack<AggregationFrame>();
+        stack.Push(new AggregationFrame(GroupNodes(nodes), ownerBucket: null));
+
+        while (stack.Count > 0)
+        {
+            var frame = stack.Peek();
+            if (frame.NextBucketIndex >= frame.Buckets.Count)
+            {
+                frame.Result.Sort((left, right) => right.InclusiveMilliseconds.CompareTo(left.InclusiveMilliseconds));
+                stack.Pop();
+
+                if (frame.OwnerBucket is not null)
+                {
+                    frame.OwnerBucket.AggregatedChildren = frame.Result;
+                    continue;
+                }
+
+                return frame.Result;
+            }
+
+            var bucket = frame.Buckets[frame.NextBucketIndex];
+            if (!bucket.ChildrenProcessed)
+            {
+                bucket.ChildrenProcessed = true;
+                var childNodes = bucket.Nodes.SelectMany(node => node.Children).ToArray();
+                if (childNodes.Length > 0)
+                {
+                    stack.Push(new AggregationFrame(GroupNodes(childNodes), bucket));
+                    continue;
+                }
+            }
+
+            frame.Result.Add(CreateAggregatedNode(bucket));
+            frame.NextBucketIndex++;
+        }
+
+        return Array.Empty<CallTreeNode>();
+    }
+
+    private static IReadOnlyList<AggregationBucket> GroupNodes(IReadOnlyList<CallTreeNode> nodes)
+    {
         var grouped = new Dictionary<AggregationKey, List<CallTreeNode>>();
         foreach (var node in nodes)
         {
@@ -146,33 +213,31 @@ public sealed class CpuCallTreeBuilder
             bucket.Add(node);
         }
 
-        var aggregatedNodes = new List<CallTreeNode>(grouped.Count);
-        foreach (var pair in grouped)
+        return grouped.Values
+            .Select(bucket => new AggregationBucket { Nodes = bucket })
+            .ToArray();
+    }
+
+    private static CallTreeNode CreateAggregatedNode(AggregationBucket bucket)
+    {
+        var nodes = bucket.Nodes;
+        var first = nodes[0];
+        var inclusiveMilliseconds = nodes.Sum(node => node.InclusiveMilliseconds);
+        var exclusiveMilliseconds = nodes.Sum(node => node.ExclusiveMilliseconds);
+        var childrenMilliseconds = nodes.Sum(node => node.ChildrenMilliseconds);
+
+        return new CallTreeNode
         {
-            var bucket = pair.Value;
-            var first = bucket[0];
-            var aggregatedChildren = AggregateAndSort(bucket.SelectMany(node => node.Children).ToArray());
-
-            var inclusiveMilliseconds = bucket.Sum(node => node.InclusiveMilliseconds);
-            var exclusiveMilliseconds = bucket.Sum(node => node.ExclusiveMilliseconds);
-            var childrenMilliseconds = bucket.Sum(node => node.ChildrenMilliseconds);
-
-            aggregatedNodes.Add(new CallTreeNode
-            {
-                Name = first.Name,
-                TimerRef = first.TimerRef,
-                StartTime = bucket.Min(node => node.StartTime),
-                EndTime = bucket.Max(node => node.EndTime),
-                InclusiveMilliseconds = inclusiveMilliseconds,
-                ExclusiveMilliseconds = exclusiveMilliseconds,
-                ChildrenMilliseconds = childrenMilliseconds,
-                StartedBeforeFrame = bucket.Any(node => node.StartedBeforeFrame),
-                EndedAfterFrame = bucket.Any(node => node.EndedAfterFrame),
-                Children = aggregatedChildren,
-            });
-        }
-
-        aggregatedNodes.Sort((left, right) => right.InclusiveMilliseconds.CompareTo(left.InclusiveMilliseconds));
-        return aggregatedNodes;
+            Name = first.Name,
+            TimerRef = first.TimerRef,
+            StartTime = nodes.Min(node => node.StartTime),
+            EndTime = nodes.Max(node => node.EndTime),
+            InclusiveMilliseconds = inclusiveMilliseconds,
+            ExclusiveMilliseconds = exclusiveMilliseconds,
+            ChildrenMilliseconds = childrenMilliseconds,
+            StartedBeforeFrame = nodes.Any(node => node.StartedBeforeFrame),
+            EndedAfterFrame = nodes.Any(node => node.EndedAfterFrame),
+            Children = bucket.AggregatedChildren,
+        };
     }
 }

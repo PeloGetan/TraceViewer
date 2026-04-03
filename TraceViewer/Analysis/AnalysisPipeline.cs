@@ -14,6 +14,17 @@ public sealed class AnalysisPipeline
 
     public TraceSession Execute(TraceReadResult readResult)
     {
+        return Execute(emit =>
+        {
+            foreach (var traceEvent in readResult.Events)
+            {
+                emit(traceEvent);
+            }
+        });
+    }
+
+    public TraceSession Execute(Action<Action<TraceEvent>> replay)
+    {
         var session = new TraceSession();
         var context = new AnalysisContext(session);
 
@@ -22,7 +33,7 @@ public sealed class AnalysisPipeline
             module.Initialize(context);
         }
 
-        foreach (var traceEvent in readResult.Events)
+        replay(traceEvent =>
         {
             foreach (var module in _modules)
             {
@@ -31,7 +42,7 @@ public sealed class AnalysisPipeline
                     module.Process(traceEvent, context);
                 }
             }
-        }
+        });
 
         foreach (var module in _modules)
         {

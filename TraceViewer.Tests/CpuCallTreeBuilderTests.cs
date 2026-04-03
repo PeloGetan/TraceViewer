@@ -83,4 +83,35 @@ public sealed class CpuCallTreeBuilderTests
         Assert.Equal(1.0, child.StartTime, 3);
         Assert.Equal(4.0, child.EndTime, 3);
     }
+
+    [Fact]
+    public void BuildForFrame_HandlesDeeplyNestedScopesWithoutRecursiveOverflow()
+    {
+        const int depth = 3000;
+
+        var session = new TraceSession();
+        var frame = session.Frames.BeginFrame(FrameType.Game, 0.0);
+        session.Frames.EndFrame(FrameType.Game, depth * 2.0);
+        session.Threads.AddGameThread(1);
+
+        var timerId = session.Timers.AddTimer("Nested", null, 0, TimerType.CpuScope);
+        var timeline = session.CpuTimelines.GetOrCreateTimeline(1);
+
+        for (var index = 0; index < depth; index++)
+        {
+            timeline.AddEvent(new TimelineEvent(index, true, TimerRef.ForTimer(timerId)));
+        }
+
+        for (var index = 0; index < depth; index++)
+        {
+            timeline.AddEvent(new TimelineEvent(depth + index + 1, false, TimerRef.ForTimer(0)));
+        }
+
+        var builder = new CpuCallTreeBuilder();
+        var threads = builder.BuildForFrame(session, frame);
+
+        var root = Assert.Single(Assert.Single(threads).Roots);
+        Assert.Equal("Nested", root.Name);
+        Assert.True(root.Children.Count > 0);
+    }
 }

@@ -17,13 +17,31 @@ public sealed class UTraceFileReader : ITraceReader
 
     public TraceReadResult Read(string traceFilePath)
     {
+        return Read(traceFilePath, null, retainEvents: true, retainPackets: true);
+    }
+
+    public TraceReadResult Read(
+        string traceFilePath,
+        Action<TraceEvent>? eventSink,
+        bool retainEvents,
+        bool retainPackets)
+    {
         ArgumentException.ThrowIfNullOrWhiteSpace(traceFilePath);
 
         using var stream = File.OpenRead(traceFilePath);
-        return Read(stream);
+        return Read(stream, eventSink, retainEvents, retainPackets);
     }
 
     internal TraceReadResult Read(Stream stream)
+    {
+        return Read(stream, null, retainEvents: true, retainPackets: true);
+    }
+
+    internal TraceReadResult Read(
+        Stream stream,
+        Action<TraceEvent>? eventSink,
+        bool retainEvents,
+        bool retainPackets)
     {
         ArgumentNullException.ThrowIfNull(stream);
         if (!stream.CanRead)
@@ -34,9 +52,10 @@ public sealed class UTraceFileReader : ITraceReader
         using var reader = new BinaryReader(stream, System.Text.Encoding.UTF8, leaveOpen: true);
         var header = ReadHeader(reader);
         var packets = ReadPackets(reader);
-        var events = new TraceEventStreamDecoder(packets).Decode();
+        var decodeResult = new TraceEventStreamDecoder(packets).Decode(eventSink, retainEvents);
+        var packetsToReturn = retainPackets ? packets : Array.Empty<TracePacket>();
 
-        return new TraceReadResult(events, header, packets);
+        return new TraceReadResult(decodeResult.Events, header, packetsToReturn, decodeResult.EventCount, packets.Count);
     }
 
     private static TraceFileHeader ReadHeader(BinaryReader reader)

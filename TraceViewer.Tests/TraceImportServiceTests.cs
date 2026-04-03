@@ -26,8 +26,10 @@ public sealed class TraceImportServiceTests
         var result = service.Import(tracePath);
 
         Assert.NotNull(result.ReadResult.FileHeader);
-        Assert.NotEmpty(result.ReadResult.Packets);
-        Assert.NotEmpty(result.ReadResult.Events);
+        Assert.True(result.ReadResult.PacketCount > 0);
+        Assert.True(result.ReadResult.EventCount > 0);
+        Assert.Empty(result.ReadResult.Packets);
+        Assert.Empty(result.ReadResult.Events);
         Assert.True(result.Session.DurationSeconds > 0);
         Assert.NotEmpty(result.Session.Threads.GetOrderedThreads());
         var gameFrames = result.Session.Frames.GetSeries(SessionModel.FrameType.Game).Frames.Where(frame => double.IsFinite(frame.EndTime)).ToArray();
@@ -48,11 +50,11 @@ public sealed class TraceImportServiceTests
             return;
         }
 
-        var service = new TraceImportService();
+        var service = new TraceImportService(retainRawTraceData: true);
         var result = service.Import(tracePath);
 
-        _output.WriteLine($"Packets: {result.ReadResult.Packets.Count}");
-        _output.WriteLine($"Events: {result.ReadResult.Events.Count}");
+        _output.WriteLine($"Packets: {result.ReadResult.PacketCount}");
+        _output.WriteLine($"Events: {result.ReadResult.EventCount}");
         _output.WriteLine($"Duration: {result.Session.DurationSeconds:F6}s");
         _output.WriteLine($"GameFrames: {result.Session.Frames.GetSeries(SessionModel.FrameType.Game).Frames.Count}");
         _output.WriteLine($"RenderFrames: {result.Session.Frames.GetSeries(SessionModel.FrameType.Rendering).Frames.Count}");
