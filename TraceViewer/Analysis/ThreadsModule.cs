@@ -20,7 +20,6 @@ public sealed class ThreadsModule : ITraceAnalysisModule
     ];
 
     private readonly Dictionary<uint, Stack<string>> _threadGroupScopes = [];
-
     public string Name => "Threads";
 
     public void Initialize(IAnalysisContext context)

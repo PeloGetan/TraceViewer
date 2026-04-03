@@ -51,4 +51,5 @@ public sealed class AnalysisPipeline
 
         return session;
     }
+
 }

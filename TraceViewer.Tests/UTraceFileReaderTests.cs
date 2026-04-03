@@ -70,6 +70,34 @@ public sealed class UTraceFileReaderTests : IDisposable
     }
 
     [Fact]
+    public void Read_DecodesMultipleEncodedPacketsInOriginalOrder()
+    {
+        var payloads = Enumerable.Range(0, 12)
+            .Select(packetIndex => Enumerable.Range(0, 256)
+                .Select(valueIndex => (byte)((packetIndex * 17 + valueIndex) % 251))
+                .ToArray())
+            .ToArray();
+
+        var tracePath = CreateTraceFile(
+            transportVersion: 4,
+            protocolVersion: 7,
+            packets: payloads
+                .Select((payload, index) => EncodedPacket((ushort)(index + 2), payload))
+                .ToArray());
+
+        var reader = new UTraceFileReader();
+        var result = reader.Read(tracePath);
+
+        Assert.Equal(payloads.Length, result.Packets.Count);
+        for (var index = 0; index < payloads.Length; index++)
+        {
+            Assert.Equal<ushort>((ushort)(index + 2), result.Packets[index].ThreadId);
+            Assert.True(result.Packets[index].IsEncoded);
+            Assert.Equal(payloads[index], result.Packets[index].Payload.ToArray());
+        }
+    }
+
+    [Fact]
     public void Read_DecodesNewTraceAndRegularEvent()
     {
         var tracePath = CreateTraceFile(

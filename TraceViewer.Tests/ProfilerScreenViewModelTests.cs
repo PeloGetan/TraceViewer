@@ -67,6 +67,96 @@ public sealed class ProfilerScreenViewModelTests
     }
 
     [Fact]
+    public void FrameBarMaxHeight_ClampsAndRebuildsBarHeights()
+    {
+        var session = CreateSession();
+        var viewModel = new ProfilerScreenViewModel(
+            new TraceImportService(),
+            new FrameTimelineQuery(),
+            new ThreadActivityQuery(new CpuCallTreeBuilder()),
+            new FunctionDetailsQuery());
+
+        viewModel.ApplyImportResult(new TraceImportResult(new TraceReadResult(Array.Empty<TraceEvent>()), session), "sample.utrace");
+        viewModel.UpdateFrameBarViewport(0.0, 8.0);
+
+        var initialHeight = viewModel.FrameBars[0].Height;
+
+        viewModel.FrameBarMaxHeight = 10.0;
+        Assert.Equal(ProfilerScreenViewModel.MinFrameBarMaxHeight, viewModel.FrameBarMaxHeight);
+        Assert.NotEqual(initialHeight, viewModel.FrameBars[0].Height);
+
+        viewModel.FrameBarMaxHeight = 2000.0;
+        Assert.Equal(ProfilerScreenViewModel.MaxFrameBarMaxHeight, viewModel.FrameBarMaxHeight);
+    }
+
+    [Fact]
+    public void UpdateFrameBarViewport_RebalancesHeightsAgainstVisibleBars()
+    {
+        var session = CreateFrameOnlySession((0.0, 1.0), (1.0, 3.0), (3.0, 8.0), (8.0, 18.0));
+        var viewModel = new ProfilerScreenViewModel(
+            new TraceImportService(),
+            new FrameTimelineQuery(),
+            new ThreadActivityQuery(new CpuCallTreeBuilder()),
+            new FunctionDetailsQuery());
+
+        viewModel.ApplyImportResult(new TraceImportResult(new TraceReadResult(Array.Empty<TraceEvent>()), session), "sample.utrace");
+
+        viewModel.UpdateFrameBarViewport(0.0, 8.0);
+        Assert.Equal(ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBars[0].Height, 3);
+        Assert.Equal(viewModel.FrameBarMaxHeight, viewModel.FrameBars[1].Height, 3);
+
+        viewModel.UpdateFrameBarViewport(20.0, 8.0);
+        Assert.Equal(ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBars[2].Height, 3);
+        Assert.Equal(viewModel.FrameBarMaxHeight, viewModel.FrameBars[3].Height, 3);
+    }
+
+    [Fact]
+    public void UpdateFrameBarViewport_RepositionsFrameBudgetGuidesAgainstVisibleBars()
+    {
+        var session = CreateFrameOnlySession((0.000, 0.005), (0.005, 0.025), (0.025, 0.055), (0.055, 0.095));
+        var viewModel = new ProfilerScreenViewModel(
+            new TraceImportService(),
+            new FrameTimelineQuery(),
+            new ThreadActivityQuery(new CpuCallTreeBuilder()),
+            new FunctionDetailsQuery());
+
+        viewModel.ApplyImportResult(new TraceImportResult(new TraceReadResult(Array.Empty<TraceEvent>()), session), "sample.utrace");
+
+        viewModel.UpdateFrameBarViewport(0.0, 8.0);
+        var firstThirtyGuide = -viewModel.ThirtyFrameBudgetGuideTranslateY;
+        var firstSixtyGuide = -viewModel.SixtyFrameBudgetGuideTranslateY;
+        var firstOneTwentyGuide = -viewModel.OneTwentyFrameBudgetGuideTranslateY;
+        var firstMedianGuide = -viewModel.MedianFrameBudgetGuideTranslateY;
+        var firstMedianLabel = viewModel.FrameBudgetGuides[3].Label;
+
+        viewModel.UpdateFrameBarViewport(20.0, 8.0);
+        var secondThirtyGuide = -viewModel.ThirtyFrameBudgetGuideTranslateY;
+        var secondSixtyGuide = -viewModel.SixtyFrameBudgetGuideTranslateY;
+        var secondOneTwentyGuide = -viewModel.OneTwentyFrameBudgetGuideTranslateY;
+        var secondMedianGuide = -viewModel.MedianFrameBudgetGuideTranslateY;
+        var secondMedianLabel = viewModel.FrameBudgetGuides[3].Label;
+
+        Assert.True(viewModel.HasFrameBudgetGuide);
+        Assert.Equal(4, viewModel.FrameBudgetGuides.Count);
+
+        Assert.InRange(firstThirtyGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+        Assert.InRange(firstSixtyGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+        Assert.InRange(firstOneTwentyGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+        Assert.InRange(firstMedianGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+
+        Assert.InRange(secondThirtyGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+        Assert.InRange(secondSixtyGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+        Assert.InRange(secondOneTwentyGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+        Assert.InRange(secondMedianGuide, ProfilerScreenViewModel.MinRenderedFrameBarHeight, viewModel.FrameBarMaxHeight);
+
+        Assert.NotEqual(firstThirtyGuide, secondThirtyGuide);
+        Assert.NotEqual(firstSixtyGuide, secondSixtyGuide);
+        Assert.NotEqual(firstOneTwentyGuide, secondOneTwentyGuide);
+        Assert.Equal("12.50 ms", firstMedianLabel);
+        Assert.Equal("35.00 ms", secondMedianLabel);
+    }
+
+    [Fact]
     public void ToggleTreeItemSelection_ShiftSelectsRangeAndClipboardExportsSelectedNames()
     {
         var session = CreateFlatSelectionSession();
@@ -274,6 +364,19 @@ public sealed class ProfilerScreenViewModelTests
         workerCTimeline.AddEvent(new TimelineEvent(2.4, false, TimerRef.ForTimer(0)));
 
         session.UpdateDuration(3.0);
+        return session;
+    }
+
+    private static TraceSession CreateFrameOnlySession(params (double Start, double End)[] ranges)
+    {
+        var session = new TraceSession();
+        foreach (var range in ranges)
+        {
+            session.Frames.BeginFrame(FrameType.Game, range.Start);
+            session.Frames.EndFrame(FrameType.Game, range.End);
+        }
+
+        session.UpdateDuration(ranges[^1].End);
         return session;
     }
 

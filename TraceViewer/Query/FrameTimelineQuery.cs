@@ -12,18 +12,8 @@ public sealed class FrameTimelineQuery
             return Array.Empty<FrameTimelineBar>();
         }
 
-        var maxDuration = visibleFrames
-            .Select(frame => Math.Max(0.0, frame.EndTime - frame.StartTime))
-            .DefaultIfEmpty(1.0)
-            .Max();
-
-        if (maxDuration <= 0.0)
-        {
-            maxDuration = 1.0;
-        }
-
         return visibleFrames
-            .Select(frame => new FrameTimelineBar(frame, Math.Max(0.05, (frame.EndTime - frame.StartTime) / maxDuration)))
+            .Select(frame => new FrameTimelineBar(frame, Math.Max(0.0, frame.EndTime - frame.StartTime)))
             .ToArray();
     }
 }

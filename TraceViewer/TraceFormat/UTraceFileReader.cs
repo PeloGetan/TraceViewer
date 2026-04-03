@@ -14,6 +14,27 @@ public sealed class UTraceFileReader : ITraceReader
     private const int RawPacketHeaderSize = 4;
     private const int EncodedPacketHeaderSize = 6;
     private const int VerificationTrailerSize = 8;
+    private const int ParallelDecodeMinimumEncodedPackets = 8;
+    private const int PacketDecodeBatchSize = 512;
+
+    private readonly bool _enableParallelPayloadDecode;
+    private readonly int _parallelDecodeMinimumEncodedPackets;
+    private readonly int _maxDecodeParallelism;
+
+    public UTraceFileReader()
+        : this(enableParallelPayloadDecode: true)
+    {
+    }
+
+    public UTraceFileReader(
+        bool enableParallelPayloadDecode,
+        int? maxDecodeParallelism = null,
+        int parallelDecodeMinimumEncodedPackets = ParallelDecodeMinimumEncodedPackets)
+    {
+        _enableParallelPayloadDecode = enableParallelPayloadDecode;
+        _parallelDecodeMinimumEncodedPackets = Math.Max(1, parallelDecodeMinimumEncodedPackets);
+        _maxDecodeParallelism = Math.Max(1, maxDecodeParallelism ?? Environment.ProcessorCount);
+    }
 
     public TraceReadResult Read(string traceFilePath)
     {
@@ -123,70 +144,145 @@ public sealed class UTraceFileReader : ITraceReader
         };
     }
 
-    private static IReadOnlyList<TracePacket> ReadPackets(BinaryReader reader)
+    private IReadOnlyList<TracePacket> ReadPackets(BinaryReader reader)
     {
         var packets = new List<TracePacket>();
+        var batch = new List<RawTracePacket>(PacketDecodeBatchSize);
 
         while (reader.BaseStream.Position < reader.BaseStream.Length)
         {
-            if (reader.BaseStream.Length - reader.BaseStream.Position < RawPacketHeaderSize)
+            batch.Add(ReadRawPacket(reader));
+            if (batch.Count >= PacketDecodeBatchSize)
             {
-                throw new InvalidDataException("Trace packet header is truncated.");
+                DecodePacketBatch(batch, packets);
+                batch.Clear();
             }
+        }
 
-            var packetSize = reader.ReadUInt16();
-            var threadInfo = reader.ReadUInt16();
-            var isEncoded = (threadInfo & EncodedMarker) != 0;
-            var hasVerificationTrailer = (threadInfo & VerificationMarker) != 0;
-            var threadId = (ushort)(threadInfo & ThreadIdMask);
-            var headerSize = isEncoded ? EncodedPacketHeaderSize : RawPacketHeaderSize;
-
-            if (packetSize < headerSize)
-            {
-                throw new InvalidDataException($"Invalid packet size {packetSize}.");
-            }
-
-            ushort? decodedSize = null;
-            if (isEncoded)
-            {
-                decodedSize = reader.ReadUInt16();
-            }
-
-            var payloadSize = packetSize - headerSize;
-            if (reader.BaseStream.Length - reader.BaseStream.Position < payloadSize)
-            {
-                throw new InvalidDataException("Trace packet payload is truncated.");
-            }
-
-            var payload = ReadExact(reader, payloadSize);
-            ReadOnlyMemory<byte> decodedPayload = payload;
-            if (isEncoded)
-            {
-                decodedPayload = DecodePayload(payload, decodedSize!.Value);
-            }
-
-            if (hasVerificationTrailer)
-            {
-                if (reader.BaseStream.Length - reader.BaseStream.Position < VerificationTrailerSize)
-                {
-                    throw new InvalidDataException("Trace verification trailer is truncated.");
-                }
-
-                _ = reader.ReadUInt64();
-            }
-
-            packets.Add(new TracePacket
-            {
-                ThreadId = threadId,
-                IsEncoded = isEncoded,
-                HasVerificationTrailer = hasVerificationTrailer,
-                PacketSize = packetSize,
-                DecodedSize = decodedSize,
-                Payload = decodedPayload,
-            });
+        if (batch.Count > 0)
+        {
+            DecodePacketBatch(batch, packets);
         }
 
         return packets;
+    }
+
+    private static RawTracePacket ReadRawPacket(BinaryReader reader)
+    {
+        if (reader.BaseStream.Length - reader.BaseStream.Position < RawPacketHeaderSize)
+        {
+            throw new InvalidDataException("Trace packet header is truncated.");
+        }
+
+        var packetSize = reader.ReadUInt16();
+        var threadInfo = reader.ReadUInt16();
+        var isEncoded = (threadInfo & EncodedMarker) != 0;
+        var hasVerificationTrailer = (threadInfo & VerificationMarker) != 0;
+        var threadId = (ushort)(threadInfo & ThreadIdMask);
+        var headerSize = isEncoded ? EncodedPacketHeaderSize : RawPacketHeaderSize;
+
+        if (packetSize < headerSize)
+        {
+            throw new InvalidDataException($"Invalid packet size {packetSize}.");
+        }
+
+        ushort? decodedSize = null;
+        if (isEncoded)
+        {
+            decodedSize = reader.ReadUInt16();
+        }
+
+        var payloadSize = packetSize - headerSize;
+        if (reader.BaseStream.Length - reader.BaseStream.Position < payloadSize)
+        {
+            throw new InvalidDataException("Trace packet payload is truncated.");
+        }
+
+        var payload = ReadExact(reader, payloadSize);
+
+        if (hasVerificationTrailer)
+        {
+            if (reader.BaseStream.Length - reader.BaseStream.Position < VerificationTrailerSize)
+            {
+                throw new InvalidDataException("Trace verification trailer is truncated.");
+            }
+
+            _ = reader.ReadUInt64();
+        }
+
+        return new RawTracePacket
+        {
+            ThreadId = threadId,
+            IsEncoded = isEncoded,
+            HasVerificationTrailer = hasVerificationTrailer,
+            PacketSize = packetSize,
+            DecodedSize = decodedSize,
+            Payload = payload,
+        };
+    }
+
+    private void DecodePacketBatch(IReadOnlyList<RawTracePacket> batch, List<TracePacket> destination)
+    {
+        var decodedBatch = new TracePacket[batch.Count];
+        if (ShouldDecodeInParallel(batch))
+        {
+            Parallel.For(
+                0,
+                batch.Count,
+                new ParallelOptions { MaxDegreeOfParallelism = _maxDecodeParallelism },
+                index => decodedBatch[index] = DecodePacket(batch[index]));
+        }
+        else
+        {
+            for (var index = 0; index < batch.Count; index++)
+            {
+                decodedBatch[index] = DecodePacket(batch[index]);
+            }
+        }
+
+        destination.AddRange(decodedBatch);
+    }
+
+    private bool ShouldDecodeInParallel(IReadOnlyList<RawTracePacket> batch)
+    {
+        if (!_enableParallelPayloadDecode || _maxDecodeParallelism <= 1 || batch.Count == 0)
+        {
+            return false;
+        }
+
+        var encodedPacketCount = 0;
+        for (var index = 0; index < batch.Count; index++)
+        {
+            if (!batch[index].IsEncoded)
+            {
+                continue;
+            }
+
+            encodedPacketCount++;
+            if (encodedPacketCount >= _parallelDecodeMinimumEncodedPackets)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static TracePacket DecodePacket(RawTracePacket packet)
+    {
+        var payload = packet.IsEncoded
+            ? DecodePayload(packet.Payload, packet.DecodedSize!.Value)
+            : packet.Payload;
+
+        return new TracePacket
+        {
+            ThreadId = packet.ThreadId,
+            IsEncoded = packet.IsEncoded,
+            HasVerificationTrailer = packet.HasVerificationTrailer,
+            PacketSize = packet.PacketSize,
+            DecodedSize = packet.DecodedSize,
+            Payload = payload,
+        };
     }
 
     private static ReadOnlyMemory<byte> DecodePayload(byte[] payload, ushort decodedSize)
@@ -210,5 +306,20 @@ public sealed class UTraceFileReader : ITraceReader
         }
 
         return data;
+    }
+
+    private sealed class RawTracePacket
+    {
+        public required ushort ThreadId { get; init; }
+
+        public required bool IsEncoded { get; init; }
+
+        public required bool HasVerificationTrailer { get; init; }
+
+        public required ushort PacketSize { get; init; }
+
+        public ushort? DecodedSize { get; init; }
+
+        public required byte[] Payload { get; init; }
     }
 }

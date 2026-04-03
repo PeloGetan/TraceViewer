@@ -1,7 +1,9 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using TraceViewer.Diagnostics;
 using TraceViewer.Import;
 using TraceViewer.Query;
 using TraceViewer.SessionModel;
@@ -10,9 +12,20 @@ namespace TraceViewer.UI.ViewModels;
 
 public sealed class ProfilerScreenViewModel : ViewModelBase
 {
+    private const double FrameBarSpacing = 2.0;
+    private const double GuideLabelMinimumOffsetFromBottom = 10.0;
+    private const double GuideLabelMaximumPadding = 8.0;
+    private const double GuideLabelMinimumGap = 18.0;
+    private const double ThirtyFramesPerSecondBudgetSeconds = 1.0 / 30.0;
+    private const double SixtyFramesPerSecondBudgetSeconds = 1.0 / 60.0;
+    private const double OneHundredTwentyFramesPerSecondBudgetSeconds = 1.0 / 120.0;
     public const double MinFrameBarWidth = 4.0;
     public const double MaxFrameBarWidth = 36.0;
     public const double DefaultFrameBarWidth = 8.0;
+    public const double MinFrameBarMaxHeight = 40.0;
+    public const double MaxFrameBarMaxHeight = 600.0;
+    public const double DefaultFrameBarMaxHeight = 150.0;
+    public const double MinRenderedFrameBarHeight = 4.0;
 
     private readonly TraceImportService _traceImportService;
     private readonly FrameTimelineQuery _frameTimelineQuery;
@@ -24,6 +37,11 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
     private TraceImportResult? _importResult;
     private string _statusText;
     private double _frameBarWidth = DefaultFrameBarWidth;
+    private double _frameBarMaxHeight = DefaultFrameBarMaxHeight;
+    private double _timelineHorizontalOffset;
+    private double _timelineViewportWidth;
+    private bool _animateFrameBarHeights;
+    private bool _suspendFrameBarHeightRefresh;
     private bool _isLoading;
 
     public ProfilerScreenViewModel()
@@ -47,6 +65,33 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         _detailsQuery = detailsQuery;
         _applicationVersion = ResolveApplicationVersion();
         _statusText = BuildStatusMessage("Open a local .utrace to populate frames, active threads, and function details.");
+        FrameBudgetGuides =
+        [
+            new FrameBudgetGuideViewModel
+            {
+                DurationSeconds = ThirtyFramesPerSecondBudgetSeconds,
+                Label = "33.33 ms",
+                Brush = "#E05555",
+            },
+            new FrameBudgetGuideViewModel
+            {
+                DurationSeconds = SixtyFramesPerSecondBudgetSeconds,
+                Label = "16.67 ms",
+                Brush = "#59C36A",
+            },
+            new FrameBudgetGuideViewModel
+            {
+                DurationSeconds = OneHundredTwentyFramesPerSecondBudgetSeconds,
+                Label = "8.33 ms",
+                Brush = "#4A90E2",
+            },
+            new FrameBudgetGuideViewModel
+            {
+                DurationSeconds = SixtyFramesPerSecondBudgetSeconds,
+                Label = "M",
+                Brush = "#8B5CF6",
+            },
+        ];
         ResetDetails();
     }
 
@@ -71,6 +116,8 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
 
     public ObservableCollection<FunctionDetailItemViewModel> Details { get; } = [];
 
+    public IReadOnlyList<FrameBudgetGuideViewModel> FrameBudgetGuides { get; }
+
     public double FrameBarWidth
     {
         get => _frameBarWidth;
@@ -84,6 +131,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
 
             _frameBarWidth = clamped;
             OnPropertyChanged();
+            RefreshFrameBarHeights();
         }
     }
 
@@ -92,6 +140,50 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
     public bool HasThreadItems => ThreadItems.Count > 0;
 
     public bool HasSelectedNode { get; private set; }
+
+    public bool HasFrameBudgetGuide => HasFrameBars;
+
+    public double FrameBudgetGuideTranslateY => SixtyFrameBudgetGuideTranslateY;
+
+    public double ThirtyFrameBudgetGuideTranslateY => FrameBudgetGuides[0].TranslateY;
+
+    public double SixtyFrameBudgetGuideTranslateY => FrameBudgetGuides[1].TranslateY;
+
+    public double OneTwentyFrameBudgetGuideTranslateY => FrameBudgetGuides[2].TranslateY;
+
+    public double MedianFrameBudgetGuideTranslateY => FrameBudgetGuides[3].TranslateY;
+
+    public bool AnimateFrameBarHeights
+    {
+        get => _animateFrameBarHeights;
+        private set
+        {
+            if (_animateFrameBarHeights == value)
+            {
+                return;
+            }
+
+            _animateFrameBarHeights = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public double FrameBarMaxHeight
+    {
+        get => _frameBarMaxHeight;
+        set
+        {
+            var clamped = Math.Clamp(value, MinFrameBarMaxHeight, MaxFrameBarMaxHeight);
+            if (Math.Abs(_frameBarMaxHeight - clamped) < 0.001)
+            {
+                return;
+            }
+
+            _frameBarMaxHeight = clamped;
+            OnPropertyChanged();
+            RefreshFrameBarHeights();
+        }
+    }
 
     public bool IsLoading
     {
@@ -111,9 +203,42 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
 
     public bool IsInteractive => !IsLoading;
 
+    public void SetFrameBarHeightAnimation(bool enabled)
+    {
+        AnimateFrameBarHeights = enabled;
+    }
+
+    public void BeginFrameBarInteraction()
+    {
+        _suspendFrameBarHeightRefresh = true;
+        AnimateFrameBarHeights = false;
+    }
+
+    public void EndFrameBarInteraction(bool animate)
+    {
+        _suspendFrameBarHeightRefresh = false;
+        AnimateFrameBarHeights = animate;
+        RefreshFrameBarHeights();
+    }
+
     public void AdjustFrameBarWidth(double delta)
     {
+        AnimateFrameBarHeights = false;
         FrameBarWidth += delta;
+    }
+
+    public void AdjustFrameBarHeightScale(double delta)
+    {
+        AnimateFrameBarHeights = false;
+        FrameBarMaxHeight += delta;
+    }
+
+    public void UpdateFrameBarViewport(double horizontalOffset, double viewportWidth, bool animate = false)
+    {
+        AnimateFrameBarHeights = animate;
+        _timelineHorizontalOffset = Math.Max(0.0, horizontalOffset);
+        _timelineViewportWidth = Math.Max(0.0, viewportWidth);
+        RefreshFrameBarHeights();
     }
 
     public async Task<bool> TryLoadDefaultTraceAsync()
@@ -131,28 +256,44 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
 
     public async Task LoadTraceAsync(string traceFilePath)
     {
+        RuntimeLoadLogger.EnsureSession(traceFilePath, nameof(LoadTraceAsync));
+        RuntimeLoadLogger.Log("load-start", $"path={traceFilePath}");
         IsLoading = true;
         StatusText = BuildStatusMessage($"Loading {Path.GetFileName(traceFilePath)}...");
 
         try
         {
+            var importWatch = Stopwatch.StartNew();
             var result = await Task.Run(() => _traceImportService.Import(traceFilePath));
+            importWatch.Stop();
+            RuntimeLoadLogger.Log(
+                "import-finished",
+                $"durationMs={importWatch.Elapsed.TotalMilliseconds:F3};eventCount={result.ReadResult.EventCount};packetCount={result.ReadResult.PacketCount}");
+
+            var applyWatch = Stopwatch.StartNew();
             ApplyImportResult(result, traceFilePath);
+            applyWatch.Stop();
+            RuntimeLoadLogger.Log(
+                "apply-finished",
+                $"durationMs={applyWatch.Elapsed.TotalMilliseconds:F3};frameBars={FrameBars.Count};threadItems={ThreadItems.Count}");
         }
         catch (Exception exception)
         {
+            RuntimeLoadLogger.Log("load-failed", $"{exception.GetType().Name}: {exception.Message}");
             StatusText = BuildStatusMessage($"Failed to load {Path.GetFileName(traceFilePath)}: {exception.Message}");
             ClearTraceView();
         }
         finally
         {
             IsLoading = false;
+            RuntimeLoadLogger.Log("loading-finished", $"isLoading={IsLoading}");
         }
     }
 
     public void ApplyImportResult(TraceImportResult result, string sourceName)
     {
         _importResult = result;
+        AnimateFrameBarHeights = false;
         RebuildFrameBars(result.Session);
 
         var completedFrames = result.Session.Frames
@@ -337,6 +478,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
 
     private void RebuildFrameBars(TraceSession session)
     {
+        var selectedFrame = FrameBars.FirstOrDefault(bar => bar.IsSelected)?.Frame;
         FrameBars.Clear();
 
         var gameSeries = session.Frames.GetSeries(FrameType.Game);
@@ -344,6 +486,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         if (completedFrames.Length == 0)
         {
             OnPropertyChanged(nameof(HasFrameBars));
+            OnPropertyChanged(nameof(HasFrameBudgetGuide));
             return;
         }
 
@@ -354,12 +497,167 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
             FrameBars.Add(new FrameBarViewModel
             {
                 Frame = bar.Frame,
-                Height = Math.Max(10.0, bar.HeightRatio * 150.0),
+                DurationSeconds = bar.DurationSeconds,
+                Height = MinRenderedFrameBarHeight,
                 Tooltip = $"Frame {bar.Frame.Index}: {((bar.Frame.EndTime - bar.Frame.StartTime) * 1000.0).ToString("F3", CultureInfo.InvariantCulture)} ms",
+                IsSelected = ReferenceEquals(bar.Frame, selectedFrame),
             });
         }
 
         OnPropertyChanged(nameof(HasFrameBars));
+        OnPropertyChanged(nameof(HasFrameBudgetGuide));
+        RefreshFrameBarHeights();
+    }
+
+    private void RefreshFrameBarHeights()
+    {
+        if (_suspendFrameBarHeightRefresh)
+        {
+            return;
+        }
+
+        if (FrameBars.Count == 0)
+        {
+            return;
+        }
+
+        var visibleBars = GetVisibleFrameBars();
+        if (visibleBars.Count == 0)
+        {
+            return;
+        }
+
+        var minDuration = visibleBars.Min(bar => bar.DurationSeconds);
+        var maxDuration = visibleBars.Max(bar => bar.DurationSeconds);
+
+        foreach (var barViewModel in FrameBars)
+        {
+            barViewModel.Height = CalculateFrameBarHeight(barViewModel.DurationSeconds, minDuration, maxDuration);
+        }
+
+        UpdateFrameBudgetGuides(minDuration, maxDuration);
+    }
+
+    private IReadOnlyList<FrameBarViewModel> GetVisibleFrameBars()
+    {
+        if (_timelineViewportWidth <= 0.0)
+        {
+            return FrameBars;
+        }
+
+        var slotWidth = FrameBarWidth + FrameBarSpacing;
+        if (slotWidth <= 0.0)
+        {
+            return FrameBars;
+        }
+
+        var startIndex = Math.Clamp((int)Math.Floor(_timelineHorizontalOffset / slotWidth), 0, Math.Max(0, FrameBars.Count - 1));
+        var visibleCount = Math.Max(1, (int)Math.Ceiling(_timelineViewportWidth / slotWidth) + 1);
+        var count = Math.Min(visibleCount, FrameBars.Count - startIndex);
+        return FrameBars.Skip(startIndex).Take(count).ToArray();
+    }
+
+    private double CalculateFrameBarHeight(double durationSeconds, double minDuration, double maxDuration)
+    {
+        if (maxDuration - minDuration <= double.Epsilon)
+        {
+            return FrameBarMaxHeight;
+        }
+
+        var normalized = Math.Clamp((durationSeconds - minDuration) / (maxDuration - minDuration), 0.0, 1.0);
+        return MinRenderedFrameBarHeight + (normalized * (FrameBarMaxHeight - MinRenderedFrameBarHeight));
+    }
+
+    private void UpdateFrameBudgetGuides(double minDuration, double maxDuration)
+    {
+        var medianGuide = FrameBudgetGuides[3];
+        var medianDuration = CalculateVisibleMedianDuration();
+        medianGuide.DurationSeconds = medianDuration;
+        medianGuide.Label = $"{(medianDuration * 1000.0).ToString("F2", CultureInfo.InvariantCulture)} ms";
+
+        var labelOffsets = new List<(FrameBudgetGuideViewModel Guide, double OffsetFromBottom)>(FrameBudgetGuides.Count);
+        foreach (var guide in FrameBudgetGuides)
+        {
+            var offsetFromBottom = CalculateFrameBarHeight(guide.DurationSeconds, minDuration, maxDuration);
+            guide.TranslateY = -offsetFromBottom;
+            labelOffsets.Add((guide, offsetFromBottom));
+        }
+
+        ApplyGuideLabelLayout(labelOffsets);
+
+        OnPropertyChanged(nameof(ThirtyFrameBudgetGuideTranslateY));
+        OnPropertyChanged(nameof(FrameBudgetGuideTranslateY));
+        OnPropertyChanged(nameof(SixtyFrameBudgetGuideTranslateY));
+        OnPropertyChanged(nameof(OneTwentyFrameBudgetGuideTranslateY));
+        OnPropertyChanged(nameof(MedianFrameBudgetGuideTranslateY));
+    }
+
+    private double CalculateVisibleMedianDuration()
+    {
+        var visibleDurations = GetVisibleFrameBars()
+            .Select(bar => bar.DurationSeconds)
+            .OrderBy(duration => duration)
+            .ToArray();
+
+        if (visibleDurations.Length == 0)
+        {
+            return SixtyFramesPerSecondBudgetSeconds;
+        }
+
+        var middleIndex = visibleDurations.Length / 2;
+        if ((visibleDurations.Length & 1) != 0)
+        {
+            return visibleDurations[middleIndex];
+        }
+
+        return (visibleDurations[middleIndex - 1] + visibleDurations[middleIndex]) * 0.5;
+    }
+
+    private void ApplyGuideLabelLayout(List<(FrameBudgetGuideViewModel Guide, double OffsetFromBottom)> labelOffsets)
+    {
+        if (labelOffsets.Count == 0)
+        {
+            return;
+        }
+
+        labelOffsets.Sort((left, right) => left.OffsetFromBottom.CompareTo(right.OffsetFromBottom));
+        var assignedOffsets = new double[labelOffsets.Count];
+        var previousOffset = GuideLabelMinimumOffsetFromBottom - GuideLabelMinimumGap;
+
+        for (var index = 0; index < labelOffsets.Count; index++)
+        {
+            assignedOffsets[index] = Math.Max(labelOffsets[index].OffsetFromBottom, previousOffset + GuideLabelMinimumGap);
+            previousOffset = assignedOffsets[index];
+        }
+
+        var maximumOffset = Math.Max(
+            GuideLabelMinimumOffsetFromBottom,
+            FrameBarMaxHeight - GuideLabelMaximumPadding);
+
+        if (assignedOffsets[^1] > maximumOffset)
+        {
+            assignedOffsets[^1] = maximumOffset;
+            for (var index = assignedOffsets.Length - 2; index >= 0; index--)
+            {
+                assignedOffsets[index] = Math.Min(
+                    assignedOffsets[index],
+                    assignedOffsets[index + 1] - GuideLabelMinimumGap);
+            }
+
+            if (assignedOffsets[0] < GuideLabelMinimumOffsetFromBottom)
+            {
+                var shift = GuideLabelMinimumOffsetFromBottom - assignedOffsets[0];
+                for (var index = 0; index < assignedOffsets.Length; index++)
+                {
+                    assignedOffsets[index] += shift;
+                }
+            }
+        }
+
+        for (var index = 0; index < labelOffsets.Count; index++)
+        {
+            labelOffsets[index].Guide.LabelTranslateY = -assignedOffsets[index];
+        }
     }
 
     private FrameInfo? FindDefaultFrame(TraceSession session, IReadOnlyList<FrameInfo> completedFrames)
@@ -468,6 +766,7 @@ public sealed class ProfilerScreenViewModel : ViewModelBase
         HasSelectedNode = false;
         OnPropertyChanged(nameof(HasSelectedNode));
         OnPropertyChanged(nameof(HasFrameBars));
+        OnPropertyChanged(nameof(HasFrameBudgetGuide));
         OnPropertyChanged(nameof(HasThreadItems));
         ResetDetails();
     }

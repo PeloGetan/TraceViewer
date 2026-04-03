@@ -9,6 +9,7 @@ internal sealed class TraceEventStreamDecoder
     private const ushort EventsThreadId = 0;
     private const ushort InternalThreadId = 1;
     private const ushort SyncThreadId = 0x3FFF;
+    private static readonly IReadOnlyDictionary<string, object?> EmptyFields = new Dictionary<string, object?>();
 
     private readonly IReadOnlyList<TracePacket> _packets;
     private readonly Dictionary<ushort, TraceEventDefinition> _definitions = [];
@@ -275,8 +276,11 @@ internal sealed class TraceEventStreamDecoder
         TraceTimestamp scopeTimestamp,
         ReadOnlySpan<byte> payload)
     {
-        var fields = new Dictionary<string, object?>(StringComparer.Ordinal);
+        Dictionary<string, object?>? fields = null;
         ReadOnlyMemory<byte> attachment = ReadOnlyMemory<byte>.Empty;
+        ulong? cpuBatchBaseCycle = null;
+        ulong? cpuEndThreadCycle = null;
+        double? cpuSecondsPerCycle = null;
 
         foreach (var field in definition.Fields)
         {
@@ -292,25 +296,61 @@ internal sealed class TraceEventStreamDecoder
             }
 
             var value = DecodeFixedValue(field.TypeInfo, payload.Slice(field.Offset, valueSize));
+            switch (definition.KnownKind)
+            {
+                case KnownEventKind.CpuProfilerBatch:
+                    switch (field.KnownRole)
+                    {
+                        case KnownFieldRole.BaseCycle:
+                            cpuBatchBaseCycle = Convert.ToUInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+                            continue;
+                        case KnownFieldRole.SecondsPerCycle:
+                            cpuSecondsPerCycle = Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+                            continue;
+                    }
+
+                    break;
+
+                case KnownEventKind.CpuProfilerEndThread:
+                    switch (field.KnownRole)
+                    {
+                        case KnownFieldRole.Cycle:
+                            cpuEndThreadCycle = Convert.ToUInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+                            continue;
+                        case KnownFieldRole.SecondsPerCycle:
+                            cpuSecondsPerCycle = Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+                            continue;
+                    }
+
+                    break;
+            }
+
             if (!string.IsNullOrEmpty(field.Name))
             {
-                fields[field.Name] = value;
+                (fields ??= new Dictionary<string, object?>(StringComparer.Ordinal))[field.Name] = value;
             }
         }
 
         if (scopePhase == TraceEventScopePhase.Enter)
         {
+            fields ??= new Dictionary<string, object?>(StringComparer.Ordinal);
             fields.TryAdd("TypeId", definition.Uid);
             fields.TryAdd("TypeName", definition.EventName);
         }
 
+        var eventFields = fields ?? EmptyFields;
         var timestamp = scopePhase == TraceEventScopePhase.Enter
             ? scopeTimestamp
-            : TryGetCycleTimestamp(fields, out var cycleTimestamp)
+            : TryGetCycleTimestamp(eventFields, out var cycleTimestamp)
                 ? cycleTimestamp
                 : CreateTimestamp(0);
 
-        return new PartialTraceEvent(definition, threadId, scopePhase, timestamp, fields, attachment);
+        return new PartialTraceEvent(definition, threadId, scopePhase, timestamp, fields, attachment)
+        {
+            CpuBatchBaseCycle = cpuBatchBaseCycle,
+            CpuEndThreadCycle = cpuEndThreadCycle,
+            CpuSecondsPerCycle = cpuSecondsPerCycle,
+        };
     }
 
     private void ConsumeAux(
@@ -353,17 +393,16 @@ internal sealed class TraceEventStreamDecoder
             if (fieldIndex < partial.Definition.Fields.Count)
             {
                 var field = partial.Definition.Fields[fieldIndex];
-                var decodedAux = DecodeAuxValue(field.TypeInfo, auxBytes);
-                if (!string.IsNullOrEmpty(field.Name))
-                {
-                    partial.Fields[field.Name] = decodedAux;
-                }
-                else
+                if (field.KnownRole is KnownFieldRole.Data or KnownFieldRole.Metadata)
                 {
                     partial.Attachment = auxBytes;
                 }
-
-                if (field.Name == "Data" || field.Name == "Metadata")
+                else if (!string.IsNullOrEmpty(field.Name))
+                {
+                    var decodedAux = DecodeAuxValue(field.TypeInfo, auxBytes);
+                    (partial.Fields ??= new Dictionary<string, object?>(StringComparer.Ordinal))[field.Name] = decodedAux;
+                }
+                else
                 {
                     partial.Attachment = auxBytes;
                 }
@@ -377,8 +416,9 @@ internal sealed class TraceEventStreamDecoder
 
     private TraceEvent FinalizeEvent(PartialTraceEvent partial, ThreadState state)
     {
+        var fields = partial.Fields ?? EmptyFields;
         var timestamp = partial.Timestamp;
-        if (timestamp.Seconds == 0 && partial.ScopePhase != TraceEventScopePhase.Enter && TryGetCycleTimestamp(partial.Fields, out var cycleTimestamp))
+        if (timestamp.Seconds == 0 && partial.ScopePhase != TraceEventScopePhase.Enter && TryGetCycleTimestamp(fields, out var cycleTimestamp))
         {
             timestamp = cycleTimestamp;
         }
@@ -390,25 +430,47 @@ internal sealed class TraceEventStreamDecoder
             timestamp = CreateTimestamp(state.BaseTimestampCycle * _secondsPerCycle.Value, state.BaseTimestampCycle);
         }
 
-        var descriptor = new TraceEventDescriptor(partial.Definition.LoggerName, partial.Definition.EventName, partial.ScopePhase);
-        var traceEvent = new TraceEvent(descriptor, timestamp, partial.ThreadId, partial.Fields, partial.Attachment);
-
-        if (partial.Definition.LoggerName == "$Trace" && partial.Definition.EventName == "NewTrace")
+        switch (partial.Definition.KnownKind)
         {
-            if (TryGetUInt64(partial.Fields, "StartCycle", out var startCycle))
+            case KnownEventKind.CpuProfilerBatch:
+                var batchSecondsPerCycle = partial.CpuSecondsPerCycle ?? timestamp.SecondsPerCycle;
+                var batchBaseCycle = partial.CpuBatchBaseCycle ?? timestamp.Cycle;
+                var batchSeconds = timestamp.Seconds;
+                if (batchSeconds == 0 &&
+                    batchBaseCycle.HasValue &&
+                    batchSecondsPerCycle.HasValue)
+                {
+                    batchSeconds = batchBaseCycle.Value * batchSecondsPerCycle.Value;
+                }
+
+                timestamp = new TraceTimestamp(batchSeconds, batchBaseCycle, batchSecondsPerCycle);
+                break;
+
+            case KnownEventKind.CpuProfilerEndThread:
+                var endThreadCycle = partial.CpuEndThreadCycle ?? timestamp.Cycle;
+                var endThreadSecondsPerCycle = partial.CpuSecondsPerCycle ?? timestamp.SecondsPerCycle;
+                timestamp = new TraceTimestamp(timestamp.Seconds, endThreadCycle, endThreadSecondsPerCycle);
+                break;
+        }
+
+        var descriptor = new TraceEventDescriptor(partial.Definition.LoggerName, partial.Definition.EventName, partial.ScopePhase);
+        var traceEvent = new TraceEvent(descriptor, timestamp, partial.ThreadId, fields, partial.Attachment);
+
+        if (partial.Definition.KnownKind == KnownEventKind.TraceNewTrace)
+        {
+            if (TryGetUInt64(fields, "StartCycle", out var startCycle))
             {
                 _startCycle = startCycle;
             }
 
-            if (TryGetUInt64(partial.Fields, "CycleFrequency", out var cycleFrequency) && cycleFrequency != 0)
+            if (TryGetUInt64(fields, "CycleFrequency", out var cycleFrequency) && cycleFrequency != 0)
             {
                 _cycleFrequency = cycleFrequency;
                 _secondsPerCycle = 1.0 / cycleFrequency;
             }
         }
-        else if (partial.Definition.LoggerName == "$Trace" &&
-                 partial.Definition.EventName == "ThreadTiming" &&
-                 TryGetInt64(partial.Fields, "BaseTimestamp", out var baseTimestampOffset))
+        else if (partial.Definition.KnownKind == KnownEventKind.TraceThreadTiming &&
+                 TryGetInt64(fields, "BaseTimestamp", out var baseTimestampOffset))
         {
             state.BaseTimestampCycle = ResolveBaseTimestampCycle(baseTimestampOffset);
         }
@@ -433,7 +495,7 @@ internal sealed class TraceEventStreamDecoder
             descriptor with { ScopePhase = TraceEventScopePhase.Leave },
             timestamp,
             state.ThreadId,
-            new Dictionary<string, object?>(),
+            EmptyFields,
             ReadOnlyMemory<byte>.Empty));
     }
 
@@ -453,6 +515,7 @@ internal sealed class TraceEventStreamDecoder
         var nameCursor = namesOffset;
         var loggerName = ReadAscii(payload, ref nameCursor, loggerNameSize);
         var eventName = ReadAscii(payload, ref nameCursor, eventNameSize);
+        var knownKind = GetKnownEventKind(loggerName, eventName);
 
         var fields = new List<TraceFieldDefinition>(fieldCount);
         var maxFixedSize = 0;
@@ -480,7 +543,13 @@ internal sealed class TraceEventStreamDecoder
                 maxFixedSize = Math.Max(maxFixedSize, offset + fixedSize);
             }
 
-            fields.Add(new TraceFieldDefinition(name, family, offset, fixedSize, typeInfo));
+            fields.Add(new TraceFieldDefinition(
+                name,
+                family,
+                offset,
+                fixedSize,
+                typeInfo,
+                GetKnownFieldRole(knownKind, name)));
         }
 
         _definitions[uid] = new TraceEventDefinition(
@@ -489,6 +558,7 @@ internal sealed class TraceEventStreamDecoder
             eventName,
             flags,
             maxFixedSize,
+            knownKind,
             fields);
     }
 
@@ -646,6 +716,65 @@ internal sealed class TraceEventStreamDecoder
         };
     }
 
+    private static KnownEventKind GetKnownEventKind(string loggerName, string eventName)
+    {
+        if (loggerName == "CpuProfiler")
+        {
+            if (eventName is "EventBatch" or "EventBatchV2" or "EventBatchV3")
+            {
+                return KnownEventKind.CpuProfilerBatch;
+            }
+
+            if (eventName == "EndThread")
+            {
+                return KnownEventKind.CpuProfilerEndThread;
+            }
+
+            return KnownEventKind.None;
+        }
+
+        if (loggerName == "$Trace")
+        {
+            if (eventName == "NewTrace")
+            {
+                return KnownEventKind.TraceNewTrace;
+            }
+
+            if (eventName == "ThreadTiming")
+            {
+                return KnownEventKind.TraceThreadTiming;
+            }
+        }
+
+        return KnownEventKind.None;
+    }
+
+    private static KnownFieldRole GetKnownFieldRole(KnownEventKind eventKind, string fieldName)
+    {
+        return eventKind switch
+        {
+            KnownEventKind.CpuProfilerBatch => fieldName switch
+            {
+                "BaseCycle" => KnownFieldRole.BaseCycle,
+                "SecondsPerCycle" => KnownFieldRole.SecondsPerCycle,
+                "Data" => KnownFieldRole.Data,
+                _ => KnownFieldRole.None,
+            },
+            KnownEventKind.CpuProfilerEndThread => fieldName switch
+            {
+                "Cycle" => KnownFieldRole.Cycle,
+                "SecondsPerCycle" => KnownFieldRole.SecondsPerCycle,
+                _ => KnownFieldRole.None,
+            },
+            _ => fieldName switch
+            {
+                "Data" => KnownFieldRole.Data,
+                "Metadata" => KnownFieldRole.Metadata,
+                _ => KnownFieldRole.None,
+            },
+        };
+    }
+
     private ThreadState GetOrAddThreadState(ushort threadId)
     {
         if (_threadStates.TryGetValue(threadId, out var state))
@@ -672,6 +801,7 @@ internal sealed class TraceEventStreamDecoder
         string EventName,
         byte Flags,
         int FixedSize,
+        KnownEventKind KnownKind,
         IReadOnlyList<TraceFieldDefinition> Fields)
     {
         public bool Important => (Flags & 0x01) != 0;
@@ -688,7 +818,8 @@ internal sealed class TraceEventStreamDecoder
         TraceFieldFamily Family,
         int Offset,
         int FixedSize,
-        byte TypeInfo)
+        byte TypeInfo,
+        KnownFieldRole KnownRole)
     {
         public bool IsAuxiliary => FixedSize == 0;
     }
@@ -700,7 +831,7 @@ internal sealed class TraceEventStreamDecoder
             uint threadId,
             TraceEventScopePhase scopePhase,
             TraceTimestamp timestamp,
-            Dictionary<string, object?> fields,
+            Dictionary<string, object?>? fields,
             ReadOnlyMemory<byte> attachment)
         {
             Definition = definition;
@@ -719,11 +850,17 @@ internal sealed class TraceEventStreamDecoder
 
         public TraceTimestamp Timestamp { get; }
 
-        public Dictionary<string, object?> Fields { get; }
+        public Dictionary<string, object?>? Fields { get; set; }
 
         public ReadOnlyMemory<byte> Attachment { get; set; }
 
         public bool IsComplete { get; set; }
+
+        public ulong? CpuBatchBaseCycle { get; set; }
+
+        public ulong? CpuEndThreadCycle { get; set; }
+
+        public double? CpuSecondsPerCycle { get; set; }
     }
 
     private sealed class ThreadState
@@ -751,6 +888,25 @@ internal sealed class TraceEventStreamDecoder
         Regular = 0,
         Reference = 1,
         DefinitionId = 2,
+    }
+
+    private enum KnownEventKind : byte
+    {
+        None = 0,
+        CpuProfilerBatch = 1,
+        CpuProfilerEndThread = 2,
+        TraceNewTrace = 3,
+        TraceThreadTiming = 4,
+    }
+
+    private enum KnownFieldRole : byte
+    {
+        None = 0,
+        BaseCycle = 1,
+        SecondsPerCycle = 2,
+        Cycle = 3,
+        Data = 4,
+        Metadata = 5,
     }
 
     internal sealed record DecodeResult(IReadOnlyList<TraceEvent> Events, int EventCount);

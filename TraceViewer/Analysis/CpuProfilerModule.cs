@@ -166,8 +166,8 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
 
     private void OnEventBatch(TraceEvent traceEvent, TraceSession session, BatchEncoding encoding)
     {
-        var baseCycle = GetUInt64(traceEvent, "BaseCycle", traceEvent.Timestamp.Cycle ?? 0UL);
-        var secondsPerCycle = GetDouble(traceEvent, "SecondsPerCycle", traceEvent.Timestamp.SecondsPerCycle ?? 0.0);
+        var baseCycle = traceEvent.Timestamp.Cycle ?? GetUInt64(traceEvent, "BaseCycle", 0UL);
+        var secondsPerCycle = traceEvent.Timestamp.SecondsPerCycle ?? GetDouble(traceEvent, "SecondsPerCycle", 0.0);
         var batchContextTime = traceEvent.Timestamp.Seconds;
         var data = GetBytes(traceEvent, "Data");
         if (data.Length == 0)
@@ -187,8 +187,8 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
             return;
         }
 
-        var cycle = GetUInt64(traceEvent, "Cycle", threadState.LastCycle);
-        var secondsPerCycle = GetDouble(traceEvent, "SecondsPerCycle");
+        var cycle = traceEvent.Timestamp.Cycle ?? GetUInt64(traceEvent, "Cycle", threadState.LastCycle);
+        var secondsPerCycle = traceEvent.Timestamp.SecondsPerCycle ?? GetDouble(traceEvent, "SecondsPerCycle");
         var timestamp = NormalizeTimelineTimestamp(threadState, cycle * secondsPerCycle);
 
         session.UpdateDuration(timestamp);
@@ -222,6 +222,10 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
     {
         var offset = 0;
         var lastCycle = threadState.LastCycle;
+        var maxDurationCandidate = session.DurationSeconds;
+        var cachedRawSpecId = uint.MaxValue;
+        var cachedTimerRef = default(TimerRef);
+        var hasCachedTimerRef = false;
 
         while (offset < data.Length)
         {
@@ -246,7 +250,11 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
                 actualCycle += baseCycle;
             }
 
-            DispatchPendingEvents(ref lastCycle, actualCycle, threadState, (decodedCycle & 1UL) != 0);
+            if (!threadState.ShouldIgnorePendingEvents && threadState.PendingEvents.Count > 0)
+            {
+                DispatchPendingEvents(ref lastCycle, actualCycle, threadState, (decodedCycle & 1UL) != 0);
+            }
+
             var actualTime = actualCycle * secondsPerCycle;
             if (batchContextTime > 0 &&
                 actualTime > batchContextTime + MaxBatchLeadSeconds)
@@ -261,7 +269,11 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
                     break;
                 }
 
-                session.UpdateDuration(actualTime);
+                if (actualTime > maxDurationCandidate)
+                {
+                    maxDurationCandidate = actualTime;
+                }
+
                 lastCycle = actualCycle;
                 continue;
             }
@@ -274,7 +286,19 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
                 }
 
                 var rawSpecId = (uint)rawSpecIdValue;
-                var timerRef = ResolveTimerRefForBegin(rawSpecId, encoding, session);
+                TimerRef timerRef;
+                if (hasCachedTimerRef && rawSpecId == cachedRawSpecId)
+                {
+                    timerRef = cachedTimerRef;
+                }
+                else
+                {
+                    timerRef = ResolveTimerRefForBegin(rawSpecId, encoding, session);
+                    cachedRawSpecId = rawSpecId;
+                    cachedTimerRef = timerRef;
+                    hasCachedTimerRef = true;
+                }
+
                 actualTime = NormalizeTimelineTimestamp(threadState, actualTime);
                 threadState.ScopeStack.Push(timerRef);
                 threadState.Timeline.AddEvent(new TimelineEvent(actualTime, true, timerRef));
@@ -286,12 +310,20 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
                 threadState.Timeline.AddEvent(new TimelineEvent(actualTime, false, TimerRef.ForTimer(0)));
             }
 
-            session.UpdateDuration(actualTime);
+            if (actualTime > maxDurationCandidate)
+            {
+                maxDurationCandidate = actualTime;
+            }
+
             lastCycle = actualCycle;
         }
 
         TrimDispatchedPendingEvents(threadState);
         threadState.LastCycle = lastCycle;
+        if (maxDurationCandidate > session.DurationSeconds)
+        {
+            session.UpdateDuration(maxDurationCandidate);
+        }
     }
 
     private void OnCpuScopeEnter(TraceEvent traceEvent, TraceSession session)
@@ -687,7 +719,9 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
     {
         if (!traceEvent.Fields.TryGetValue(fieldName, out var value) || value is null)
         {
-            return ReadOnlySpan<byte>.Empty;
+            return fieldName is "Data" or "Metadata" or "Payload"
+                ? traceEvent.Attachment.Span
+                : ReadOnlySpan<byte>.Empty;
         }
 
         return value switch
@@ -700,13 +734,18 @@ public sealed class CpuProfilerModule : ITraceAnalysisModule
 
     private static ReadOnlyMemory<byte> GetPayload(TraceEvent traceEvent)
     {
+        if (!traceEvent.Attachment.IsEmpty)
+        {
+            return traceEvent.Attachment;
+        }
+
         var payload = GetBytes(traceEvent, "Payload");
         if (!payload.IsEmpty)
         {
             return payload.ToArray();
         }
 
-        return traceEvent.Attachment;
+        return ReadOnlyMemory<byte>.Empty;
     }
 
     private static bool TryGetEventCycle(TraceEvent traceEvent, out ulong cycle)
