@@ -39,19 +39,26 @@ internal sealed class TraceEventStreamDecoder
             }
         }
 
+        // The event-registry (thread 0) and important-event (thread 1) channels are each a
+        // single continuous byte stream chunked across many transport packets. An event can
+        // span a packet boundary, so accumulate per channel and only frame complete events;
+        // framing each packet independently corrupts large traces (mid-event packet splits).
+        var importantStreams = new Dictionary<ushort, ImportantStream>();
         foreach (var packet in _packets)
         {
-            if (packet.ThreadId is EventsThreadId or InternalThreadId)
+            if (packet.ThreadId is not (EventsThreadId or InternalThreadId))
             {
-                try
-                {
-                    DecodeImportantPacket(packet, Emit);
-                }
-                catch (InvalidDataException)
-                {
-                    // Keep packet transport parsing robust while the event decoder is still incomplete.
-                }
+                continue;
             }
+
+            if (!importantStreams.TryGetValue(packet.ThreadId, out var importantStream))
+            {
+                importantStream = new ImportantStream(GetOrAddThreadState(packet.ThreadId));
+                importantStreams.Add(packet.ThreadId, importantStream);
+            }
+
+            importantStream.Append(packet.Payload.Span);
+            DrainImportantStream(importantStream, Emit);
         }
 
         foreach (var packet in _packets)
@@ -83,53 +90,69 @@ internal sealed class TraceEventStreamDecoder
         return new DecodeResult(events, eventCount);
     }
 
-    private void DecodeImportantPacket(TracePacket packet, Action<TraceEvent> emit)
+    private void DrainImportantStream(ImportantStream stream, Action<TraceEvent> emit)
     {
-        var data = packet.Payload.Span;
-        var offset = 0;
-        var state = GetOrAddThreadState(packet.ThreadId);
+        var data = stream.Buffer.AsSpan(0, stream.Length);
+        var offset = stream.Consumed;
 
-        while (offset < data.Length)
+        while (true)
         {
-            EnsureAvailable(data, offset, 4, "important event header");
+            if (offset + 4 > data.Length)
+            {
+                break;
+            }
 
             var uid = BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]);
-            offset += 2;
-
-            var size = BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]);
-            offset += 2;
-            EnsureAvailable(data, offset, size, "important event payload");
-
-            var payload = data.Slice(offset, size);
-            offset += size;
-
-            if (uid == 0)
+            var size = BinaryPrimitives.ReadUInt16LittleEndian(data[(offset + 2)..]);
+            if (offset + 4 + size > data.Length)
             {
-                RegisterDefinition(payload);
-                continue;
+                // The remaining bytes are the head of an event continued in a later packet.
+                break;
             }
 
-            if (!_definitions.TryGetValue(uid, out var definition))
+            var payload = data.Slice(offset + 4, size);
+            offset += 4 + size;
+            stream.Consumed = offset;
+
+            try
             {
-                continue;
+                ProcessImportantEvent(uid, payload, stream.State, emit);
             }
-
-            var partial = CreatePartialEvent(definition, packet.ThreadId, TraceEventScopePhase.None, default, payload);
-            if (definition.MaybeHasAux)
+            catch (InvalidDataException)
             {
-                var payloadOffset = definition.FixedSize;
-                ConsumeAux(ref partial, payload, ref payloadOffset, state, emit);
-                if (!partial.IsComplete)
-                {
-                    partial.IsComplete = true;
-                    emit(FinalizeEvent(partial, state));
-                }
-
-                continue;
+                // Skip a malformed important event but keep the channel framed for the rest.
             }
-
-            emit(FinalizeEvent(partial, state));
         }
+    }
+
+    private void ProcessImportantEvent(ushort uid, ReadOnlySpan<byte> payload, ThreadState state, Action<TraceEvent> emit)
+    {
+        if (uid == 0)
+        {
+            RegisterDefinition(payload);
+            return;
+        }
+
+        if (!_definitions.TryGetValue(uid, out var definition))
+        {
+            return;
+        }
+
+        var partial = CreatePartialEvent(definition, state.ThreadId, TraceEventScopePhase.None, default, payload);
+        if (definition.MaybeHasAux)
+        {
+            var payloadOffset = definition.FixedSize;
+            ConsumeAux(ref partial, payload, ref payloadOffset, state, emit);
+            if (!partial.IsComplete)
+            {
+                partial.IsComplete = true;
+                emit(FinalizeEvent(partial, state));
+            }
+
+            return;
+        }
+
+        emit(FinalizeEvent(partial, state));
     }
 
     private void DecodeThreadPacket(TracePacket packet, Action<TraceEvent> emit)
@@ -861,6 +884,49 @@ internal sealed class TraceEventStreamDecoder
         public ulong? CpuEndThreadCycle { get; set; }
 
         public double? CpuSecondsPerCycle { get; set; }
+    }
+
+    private sealed class ImportantStream
+    {
+        public ImportantStream(ThreadState state)
+        {
+            State = state;
+        }
+
+        private byte[] _buffer = Array.Empty<byte>();
+
+        public ThreadState State { get; }
+
+        public byte[] Buffer => _buffer;
+
+        public int Length { get; private set; }
+
+        public int Consumed { get; set; }
+
+        public void Append(ReadOnlySpan<byte> data)
+        {
+            // Drop the framed prefix so the buffer only ever holds the unframed tail plus new bytes.
+            if (Consumed > 0)
+            {
+                var remaining = Length - Consumed;
+                if (remaining > 0)
+                {
+                    Array.Copy(_buffer, Consumed, _buffer, 0, remaining);
+                }
+
+                Length = remaining;
+                Consumed = 0;
+            }
+
+            var required = Length + data.Length;
+            if (_buffer.Length < required)
+            {
+                Array.Resize(ref _buffer, Math.Max(required, Math.Max(1024, _buffer.Length * 2)));
+            }
+
+            data.CopyTo(_buffer.AsSpan(Length));
+            Length += data.Length;
+        }
     }
 
     private sealed class ThreadState
